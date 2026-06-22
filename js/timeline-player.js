@@ -19,6 +19,7 @@ class TimelinePlayer {
     this.timeline = options.timeline;
     this.onChoiceCallback = options.onChoice || (() => {});
     this.onCompleteCallback = options.onComplete || (() => {});
+    this.onBackToMenuCallback = options.onBackToMenu || null;
 
     // 渲染器
     this.renderer = new Renderer(this.ctx, this.width, this.height);
