@@ -326,6 +326,16 @@ async function loadStory(storyId) {
       },
       onComplete: () => {
         console.log('体验完成');
+      },
+      onBackToMenu: () => {
+        // 停止当前游戏循环
+        player = null;
+        // 移除所有事件监听器（通过替换canvas节点）
+        const oldCanvas = document.getElementById('gameCanvas');
+        const newCanvas = oldCanvas.cloneNode(true);
+        oldCanvas.parentNode.replaceChild(newCanvas, oldCanvas);
+        // 回到故事选择界面
+        showStorySelector();
       }
     });
 
