@@ -1,0 +1,445 @@
+/**
+ * Timeline播放器 - 数据驱动的沉浸式体验控制器
+ * 管理事件流转、交互选择、进度追踪
+ */
+
+// TONE_COLORS 延迟获取，避免脚本加载时 Renderer 尚未就绪
+var TONE_COLORS = null;
+
+class TimelinePlayer {
+  constructor(options) {
+    // 确保 TONE_COLORS 已初始化
+    if (!TONE_COLORS && window.Renderer) {
+      TONE_COLORS = window.Renderer.TONE_COLORS;
+    }
+    this.canvas = options.canvas;
+    this.ctx = options.ctx;
+    this.width = options.width;
+    this.height = options.height;
+    this.timeline = options.timeline;
+    this.onChoiceCallback = options.onChoice || (() => {});
+    this.onCompleteCallback = options.onComplete || (() => {});
+
+    // 渲染器
+    this.renderer = new Renderer(this.ctx, this.width, this.height);
+
+    // 播放状态
+    this.currentEventIndex = 0;
+    this.state = 'idle'; // idle | safety_prompt | typing | waiting | choosing | feedback | echo | complete
+    this.selectedChoice = -1;
+    this.choiceFeedbackTimer = 0;
+    this.choiceFeedbackDuration = 3; // 秒
+
+    // PRD V3.0 回响环节状态
+    this.echoStep = 0; // 0=渐弱音景 1=身份锚定 2=记录入口 3=温和出口
+    this.echoTimer = 0;
+    this.echoUserInput = '';
+
+    // 安全提示（PRD V2.1 UESL模型）
+    this.safetyLevel = (this.timeline.safetyInfo && this.timeline.safetyInfo.complianceLevel) || 'L1';
+    this.requiresSafetyPrompt = this.safetyLevel === 'L2' || this.safetyLevel === 'L3' || this.safetyLevel === 'L4';
+
+    // 触摸检测
+    this.touchStartY = 0;
+    this.touchStartTime = 0;
+
+    // 预计算选项区域（用于点击检测）
+    this.choiceRects = [];
+
+    // 防重复定时器
+    this._advanceTimer = null;
+  }
+
+  /**
+   * 开始体验
+   */
+  start() {
+    // 清理可能残留的定时器，防止重启时旧timer触发
+    if (this._advanceTimer) {
+      clearTimeout(this._advanceTimer);
+      this._advanceTimer = null;
+    }
+    this.currentEventIndex = 0;
+    // PRD V2.1: L2+故事开始前显示心理安全提示
+    if (this.requiresSafetyPrompt) {
+      this.state = 'safety_prompt';
+      this.renderer.setText(this._getSafetyPromptText(), 0.3);
+      this.renderer.fadeAlpha = 0;
+      this.renderer.fadeTarget = 1;
+    } else {
+      this._loadEvent(0);
+      this.renderer.fadeAlpha = 0;
+      this.renderer.fadeTarget = 1;
+    }
+  }
+
+  /**
+   * 获取安全提示文本（PRD V2.1 UESL模型）
+   */
+  _getSafetyPromptText() {
+    const level = this.safetyLevel;
+    if (level === 'L3' || level === 'L4') {
+      return '⚠️ 本故事涉及较重情感内容。\n\n如果你正在经历类似困境，请确保有亲友陪伴或寻求专业支持。\n\n体验过程中可随时点击退出。\n\n心理援助热线：400-161-9995\n\n准备好后，点击开始体验。';
+    }
+    // L2
+    return '💡 本故事涉及一些情感话题。\n\n如果感到不适，可以随时暂停或退出。\n\n准备好后，点击开始体验。';
+  }
+
+  /**
+   * 每帧更新
+   */
+  update(dt) {
+    this.renderer.update(dt);
+
+    // 选择反馈倒计时
+    if (this.state === 'feedback') {
+      this.choiceFeedbackTimer -= dt;
+      if (this.choiceFeedbackTimer <= 0) {
+        this._advanceToNextEvent();
+      }
+    }
+
+    // PRD V3.0 回响环节更新
+    if (this.state === 'echo') {
+      this._updateEcho(dt);
+    }
+  }
+
+  /**
+   * 每帧渲染
+   */
+  render() {
+    // echo/complete状态下不渲染event内容，由回响环节自行处理
+    if (this.state === 'echo' || this.state === 'complete') {
+      const progress = 1;
+      this.renderer.render({
+        title: '',
+        subtitle: null,
+        choices: null,
+        selectedChoice: -1,
+        progress: progress,
+        feedbackText: null
+      });
+      return;
+    }
+
+    const event = this.timeline.events[this.currentEventIndex];
+    if (!event) return;
+
+    const progress = (this.currentEventIndex) / this.timeline.events.length;
+
+    this.renderer.render({
+      title: event.title,
+      subtitle: this.currentEventIndex === 0 ? this.timeline.meta.subtitle : null,
+      choices: this.state === 'choosing' ? this._getChoices(event) : null,
+      selectedChoice: this.selectedChoice,
+      progress: progress,
+      feedbackText: this.state === 'feedback' ? this._getFeedbackText(event) : null
+    });
+
+    // 反馈文本覆盖渲染
+    if (this.state === 'feedback') {
+      this._renderFeedbackOverlay();
+    }
+  }
+
+  // === 触摸事件处理 ===
+
+  onTouchStart(e) {
+    this.touchStartY = e.touches[0].clientY;
+    this.touchStartTime = Date.now();
+  }
+
+  onTouchMove(e) {
+    // 预留：未来支持滑动翻页
+  }
+
+  onTouchEnd(e) {
+    // 防御性检查：changedTouches可能为空
+    if (!e.changedTouches || e.changedTouches.length === 0) return;
+    
+    const touchY = e.changedTouches[0].clientY;
+    const dy = Math.abs(touchY - this.touchStartY);
+    const dt = Date.now() - this.touchStartTime;
+
+    // 过滤滑动操作（只处理点击）
+    if (dy > 30 || dt > 500) return;
+
+    this._handleTap(e.changedTouches[0].clientX, touchY);
+  }
+
+  _handleTap(x, y) {
+    switch (this.state) {
+      case 'safety_prompt':
+        // PRD V2.1: 用户确认安全提示后开始体验
+        this._loadEvent(0);
+        break;
+
+      case 'typing':
+        // 点击跳过打字动画
+        this.renderer.skipTyping();
+        this.state = this._hasChoices() ? 'choosing' : 'waiting';
+        break;
+
+      case 'waiting':
+        // 点击进入下一事件或选择
+        if (this._hasChoices()) {
+          this.state = 'choosing';
+          this.selectedChoice = -1;
+        } else {
+          this._advanceToNextEvent();
+        }
+        break;
+
+      case 'choosing':
+        // 检测点击了哪个选项
+        const choiceIdx = this._hitTestChoice(x, y);
+        if (choiceIdx >= 0) {
+          this.selectedChoice = choiceIdx;
+          const event = this.timeline.events[this.currentEventIndex];
+          this.onChoiceCallback(event.id, choiceIdx);
+          
+          // 显示反馈文本（保持情感节拍器节奏）
+          this.state = 'feedback';
+          this.choiceFeedbackTimer = this.choiceFeedbackDuration;
+          const feedbackText = this._getFeedbackText(event);
+          // 反馈文本使用中等情绪强度0.5，避免过快或过慢
+          this.renderer.setText(feedbackText, 0.5);
+        }
+        break;
+
+      case 'feedback':
+        // 点击跳过反馈等待
+        this._advanceToNextEvent();
+        break;
+
+      case 'echo':
+        // PRD V3.0 回响环节点击处理
+        this._handleEchoTap();
+        break;
+
+      case 'complete':
+        // 体验结束，可重新开始
+        this.start();
+        break;
+    }
+  }
+
+  // === 事件流转逻辑 ===
+
+  _loadEvent(index) {
+    if (index >= this.timeline.events.length) {
+      // PRD V3.0: 进入回响环节而非直接complete
+      this._startEchoPhase();
+      return;
+    }
+
+    this.currentEventIndex = index;
+    const event = this.timeline.events[index];
+    
+    // 边界检查：确保event有效
+    if (!event) {
+      console.warn(`[TimelinePlayer] Event at index ${index} is undefined, skipping`);
+      this._advanceToNextEvent();
+      return;
+    }
+
+    // 设置叙事文本和视觉色调
+    const narrativeText = event.narrativeText || event.description || '';
+    // PRD V2.1情感节拍器：传入情绪强度调节打字速度
+    this.renderer.setText(narrativeText, event.emotionIntensity);
+    if (event.visualTone) {
+      this.renderer.setTone(event.visualTone);
+    }
+
+    this.state = 'typing';
+    this.selectedChoice = -1;
+  }
+
+  _advanceToNextEvent() {
+    // 防止重复触发
+    if (this._advanceTimer) return;
+    
+    // 淡出 → 加载下一事件 → 淡入
+    this.renderer.fadeTarget = 0;
+    this._advanceTimer = setTimeout(() => {
+      try {
+        this._loadEvent(this.currentEventIndex + 1);
+        this.renderer.fadeTarget = 1;
+      } catch (e) {
+        console.error('[TimelinePlayer] Failed to load event:', e);
+        this.state = 'idle';
+      } finally {
+        this._advanceTimer = null;
+      }
+    }, 500);
+  }
+
+  /**
+   * 销毁播放器，清理所有定时器和资源
+   */
+  destroy() {
+    if (this._advanceTimer) {
+      clearTimeout(this._advanceTimer);
+      this._advanceTimer = null;
+    }
+    this.state = 'idle';
+  }
+
+  _hasChoices() {
+    const event = this.timeline.events[this.currentEventIndex];
+    return event && event.isKeyNode && event.interactionChoice && event.interactionChoice.options;
+  }
+
+  _getChoices(event) {
+    if (!event.interactionChoice) return null;
+    return event.interactionChoice.options.map(o => ({ label: o.label }));
+  }
+
+  _getFeedbackText(event) {
+    if (!event.interactionChoice || this.selectedChoice < 0) return '';
+    return event.interactionChoice.options[this.selectedChoice].response || '';
+  }
+
+  // === 选项点击检测 ===
+
+  _hitTestChoice(x, y) {
+    const event = this.timeline.events[this.currentEventIndex];
+    if (!event.interactionChoice) return -1;
+
+    const choices = event.interactionChoice.options;
+    const choiceH = 60;
+    const gap = 16;
+    const totalH = choices.length * (choiceH + gap) - gap;
+    const startY = this.height - totalH - 80;
+    const padding = 30;
+
+    for (let i = 0; i < choices.length; i++) {
+      const cy = startY + i * (choiceH + gap);
+      if (x >= padding && x <= this.width - padding && y >= cy && y <= cy + choiceH) {
+        return i;
+      }
+    }
+    return -1;
+  }
+
+  // === 反馈文字叠加渲染 ===
+
+  _renderFeedbackOverlay() {
+    const ctx = this.ctx;
+    const w = this.width;
+    const h = this.height;
+
+    // 半透明遮罩
+    ctx.fillStyle = 'rgba(0,0,0,0.6)';
+    ctx.fillRect(0, 0, w, h);
+
+    // 反馈文字居中
+    const colors = TONE_COLORS[this.renderer.targetTone] || TONE_COLORS.neutral;
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#FFFFFF';
+    ctx.font = '22px "PingFang SC", serif';
+
+    const text = this._getFeedbackText(this.timeline.events[this.currentEventIndex]);
+    const lines = this._wrapFeedbackText(ctx, text, w - 80);
+    const lineHeight = 38;
+    const totalTextH = lines.length * lineHeight;
+    const startY = (h - totalTextH) / 2;
+
+    lines.forEach((line, i) => {
+      ctx.fillText(line, w / 2, startY + i * lineHeight);
+    });
+
+    // 提示
+    ctx.globalAlpha = 0.5;
+    ctx.font = '14px "PingFang SC", sans-serif';
+    ctx.fillText('点击继续', w / 2, h - 60);
+    ctx.globalAlpha = 1;
+  }
+
+  _wrapFeedbackText(ctx, text, maxWidth) {
+    // 复用Renderer的_wrapText方法，避免代码重复
+    return this.renderer._wrapText(ctx, text, maxWidth);
+  }
+
+  // === PRD V3.0 回响环节 ===
+
+  /**
+   * 启动回响环节（体验结束后的结构化过渡）
+   * 四步流程：渐弱音景→身份锚定→记录入口→温和出口
+   */
+  _startEchoPhase() {
+    this.state = 'echo';
+    this.echoStep = 0;
+    this.echoTimer = 0;
+    this.echoUserInput = '';
+    // 步骤0：渐弱音景（3秒BGM渐弱至静默）
+    this.renderer.setText('', 0.1);
+    this.renderer.fadeTarget = 1;
+    this.onCompleteCallback();
+  }
+
+  /**
+   * 回响环节每帧更新
+   */
+  _updateEcho(dt) {
+    this.echoTimer += dt;
+    if (this.echoStep === 0 && this.echoTimer >= 3) {
+      // 步骤0完成，进入身份锚定
+      this.echoStep = 1;
+      this.echoTimer = 0;
+      this.renderer.setText(this._getIdentityAnchorText(), 0.2);
+    }
+    if (this.echoStep === 1 && this.echoTimer >= 4) {
+      // 步骤1完成（身份锚定展示≥3秒），进入记录入口
+      this.echoStep = 2;
+      this.echoTimer = 0;
+      this.renderer.setText(this._getEchoRecordPrompt(), 0.2);
+    }
+    // 步骤2和3等待用户点击
+  }
+
+  /**
+   * 回响环节的点击处理
+   */
+  _handleEchoTap() {
+    if (this.echoStep === 0 || this.echoStep === 1) {
+      // 渐弱/身份锚定阶段不可跳过（PRD V3.0强制要求身份锚定≥3秒）
+      return;
+    }
+    if (this.echoStep === 2) {
+      // 记录入口→温和出口
+      this.echoStep = 3;
+      this.echoTimer = 0;
+      this.renderer.setText(this._getGentleExitText(), 0.2);
+    } else if (this.echoStep === 3) {
+      // 温和出口→complete
+      this.state = 'complete';
+      this.renderer.setText('感谢你的陪伴。\n\n点击重新开始。', 0.3);
+    }
+  }
+
+  /**
+   * 身份锚定提示文本（PRD V3.0强制要求，不可跳过，展示≥3秒）
+   */
+  _getIdentityAnchorText() {
+    const title = (this.timeline.meta && this.timeline.meta.title) || '这段人生';
+    return `你刚刚体验的是「${title}」的人生片段。\n\n现在，请慢慢回到你自己的生活中。\n\n深呼吸一次，感受此刻的自己。`;
+  }
+
+  /**
+   * 回响记录入口提示（可选文字输入，低门槛引导语）
+   */
+  _getEchoRecordPrompt() {
+    return '如果这段体验让你想起了什么，\n哪怕只是一个词、一种感觉，\n可以轻轻写下来。\n\n（点击继续，或停留片刻）';
+  }
+
+  /**
+   * 温和出口文本（推荐轻松体验+稍后再来，禁止直接推送付费内容）
+   */
+  _getGentleExitText() {
+    return '每一段人生都值得被温柔对待。\n\n你可以稍后再来，也可以试试其他故事。\n\n不着急，按自己的节奏来。';
+  }
+}
+
+window.TimelinePlayer = TimelinePlayer;
