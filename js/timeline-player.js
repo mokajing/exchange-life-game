@@ -44,6 +44,9 @@ class TimelinePlayer {
     this.characterProfile = (this.timeline.meta && this.timeline.meta.characterProfile) || null;
     this._profileShown = false;
 
+    // Phase 3: 后果标签系统
+    this._consequenceLabel = null;
+
     // 触摸检测
     this.touchStartY = 0;
     this.touchStartTime = 0;
@@ -389,6 +392,8 @@ class TimelinePlayer {
           this.state = 'feedback';
           this.choiceFeedbackTimer = this.choiceFeedbackDuration;
           const feedbackText = this._getFeedbackText(event);
+          // Phase 3: 提取后果标签
+          this._consequenceLabel = this._getConsequenceHint(event);
           // 反馈文本使用中等情绪强度0.5，避免过快或过慢
           this.renderer.setText(feedbackText, 0.5);
         }
@@ -540,7 +545,32 @@ class TimelinePlayer {
 
   _getFeedbackText(event) {
     if (!event.interactionChoice || this.selectedChoice < 0) return '';
-    return event.interactionChoice.options[this.selectedChoice].response || '';
+    const response = event.interactionChoice.options[this.selectedChoice].response;
+    
+    // Phase 3: 向后兼容 - 支持旧格式(字符串)和新格式(三层对象)
+    if (typeof response === 'string') {
+      return response;
+    }
+    if (response && typeof response === 'object') {
+      const parts = [];
+      if (response.immediateReaction) parts.push(response.immediateReaction);
+      if (response.innerThought) parts.push('\n\n' + response.innerThought);
+      // consequenceHint不在反馈文本中显示，由后果标签系统单独处理
+      return parts.join('');
+    }
+    return '';
+  }
+
+  /**
+   * Phase 3: 获取当前选择的后果提示标签
+   */
+  _getConsequenceHint(event) {
+    if (!event.interactionChoice || this.selectedChoice < 0) return null;
+    const response = event.interactionChoice.options[this.selectedChoice].response;
+    if (response && typeof response === 'object' && response.consequenceHint) {
+      return response.consequenceHint;
+    }
+    return null;
   }
 
   // === 选项点击检测 ===
@@ -597,6 +627,15 @@ class TimelinePlayer {
     ctx.font = '14px "PingFang SC", sans-serif';
     ctx.fillText('点击继续', w / 2, h - 60);
     ctx.globalAlpha = 1;
+
+    // Phase 3: 后果标签 - 灰色小字显示在底部
+    if (this._consequenceLabel) {
+      ctx.globalAlpha = 0.4;
+      ctx.fillStyle = '#999999';
+      ctx.font = '12px "PingFang SC", sans-serif';
+      ctx.fillText(this._consequenceLabel, w / 2, h - 36);
+      ctx.globalAlpha = 1;
+    }
   }
 
   _wrapFeedbackText(ctx, text, maxWidth) {
